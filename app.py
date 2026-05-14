@@ -3,23 +3,31 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import date, datetime, timedelta
 import numpy as np
+from collections import defaultdict
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- AUTH ----------
+# ---------- AUTH (two passwords) ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+    st.session_state.user_role = None
 
 if not st.session_state.authenticated:
     pwd = st.text_input("Enter access password", type="password")
     if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
         st.session_state.authenticated = True
+        st.session_state.user_role = "admin"
         st.rerun()
-    else:
-        st.stop()
+    elif pwd == st.secrets.get("VIEWER_PASSWORD", ""):
+        st.session_state.authenticated = True
+        st.session_state.user_role = "viewer"
+        st.rerun()
+    elif pwd:  # only show error if something was entered
+        st.error("Incorrect password")
+    st.stop()
 
 # ---------- EMAIL LINK AUTO-MARK (One-Click Done from Email) ----------
 params = st.query_params
@@ -44,18 +52,32 @@ if selected_branch_name == "All Branches":
 else:
     branch_id = next(b['id'] for b in branches_data if b['name'] == selected_branch_name)
 
-# ---------- NAVIGATION ----------
-page = st.sidebar.radio("Go to", [
-    "Dashboard",
-    "Branches",
-    "Products",
-    "Inventory",
-    "CSV Upload",
-    "Alerts & Advisories",
-    "AI Limits",
-    "Risk & FEFO",
-    "Transfer Suggestions"      # <-- NEW PAGE
-])
+# ---------- NAVIGATION (role‑based) ----------
+if st.session_state.user_role == "admin":
+    pages = [
+        "Dashboard",
+        "Branches",
+        "Products",
+        "Inventory",
+        "CSV Upload",
+        "Alerts & Advisories",
+        "AI Limits",
+        "Risk & FEFO",
+        "Transfer Suggestions"
+    ]
+else:  # viewer
+    pages = [
+        "Dashboard",
+        "Products",
+        "Inventory",
+        "CSV Upload",
+        "Alerts & Advisories",
+        "AI Limits",
+        "Risk & FEFO",
+        "Transfer Suggestions"
+    ]
+
+page = st.sidebar.radio("Go to", pages)
 
 # ---------- HELPERS ----------
 def validate_csv_columns(df, required_cols, label="CSV"):
@@ -76,7 +98,6 @@ def upload_csv_to_table(table_name, df, extra_columns={}):
         return None
 
 def get_sales_velocity(branch_id, product_id, days_back=30):
-    """Returns avg daily demand (units/day) for product+branch."""
     limit_res = supabase.table("stock_limits").select("avg_daily_demand") \
         .eq("branch_id", branch_id).eq("product_id", product_id).execute()
     if limit_res.data and limit_res.data[0].get("avg_daily_demand") is not None:
@@ -92,19 +113,17 @@ def get_sales_velocity(branch_id, product_id, days_back=30):
     return 0.0
 
 def get_reorder_point(branch_id, product_id):
-    """Fetch reorder point from stock_limits if exists, else compute from demand (lead time 7 days)."""
     lim = supabase.table("stock_limits").select("reorder_point, safety_stock") \
         .eq("branch_id", branch_id).eq("product_id", product_id).execute()
     if lim.data:
         return lim.data[0].get("reorder_point", 0), lim.data[0].get("safety_stock", 0)
-    # fallback: demand * lead_time (7 days) + 5 units safety
     demand = get_sales_velocity(branch_id, product_id)
     reorder = max(5, int(demand * 7))
     safety = max(3, int(demand * 3))
     return reorder, safety
 
 # ============================================================
-# PAGE: DASHBOARD (unchanged)
+# PAGE: DASHBOARD
 # ============================================================
 if page == "Dashboard":
     st.header("📊 Executive Summary")
@@ -141,9 +160,14 @@ if page == "Dashboard":
         st.info("No alert data available yet. Run the daily Edge Function to generate alerts.")
 
 # ============================================================
-# PAGE: BRANCHES (unchanged)
+# PAGE: BRANCHES (with admin‑only guard)
 # ============================================================
 elif page == "Branches":
+    # Extra hardening: stop viewers even if they manually navigate here
+    if st.session_state.user_role != "admin":
+        st.error("You do not have permission to manage branches.")
+        st.stop()
+
     st.header("🏢 Branch Management")
     st.subheader("Current Branches")
     all_branches = supabase.table("branches").select("*").execute().data
@@ -214,7 +238,7 @@ elif page == "Branches":
                 st.error(f"Upload failed: {e}")
 
 # ============================================================
-# PAGE: PRODUCTS (unchanged)
+# PAGE: PRODUCTS
 # ============================================================
 elif page == "Products":
     st.header("📦 Products Master")
@@ -286,7 +310,7 @@ elif page == "Products":
                 st.error(f"Upload failed: {e}")
 
 # ============================================================
-# PAGE: INVENTORY (unchanged)
+# PAGE: INVENTORY
 # ============================================================
 elif page == "Inventory":
     st.header("📦 Current Inventory")
@@ -331,7 +355,7 @@ elif page == "Inventory":
                     st.rerun()
 
 # ============================================================
-# PAGE: CSV UPLOAD (unchanged)
+# PAGE: CSV UPLOAD
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
@@ -394,7 +418,7 @@ elif page == "CSV Upload":
                     st.success(f"Movements uploaded for {selected_branch_label}!")
 
 # ============================================================
-# PAGE: ALERTS & ADVISORIES (unchanged)
+# PAGE: ALERTS & ADVISORIES
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
@@ -425,7 +449,7 @@ elif page == "Alerts & Advisories":
         st.info("No alerts available. Good job!")
 
 # ============================================================
-# PAGE: AI LIMITS (unchanged)
+# PAGE: AI LIMITS
 # ============================================================
 elif page == "AI Limits":
     st.header("📊 AI-Computed Stock Limits")
@@ -443,7 +467,7 @@ elif page == "AI Limits":
         st.info("No AI limits computed yet. Ensure the Edge Function has run and stock movements exist.")
 
 # ============================================================
-# PAGE: RISK & FEFO (unchanged)
+# PAGE: RISK & FEFO (with skipped_no_expiry counter)
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -469,6 +493,7 @@ elif page == "Risk & FEFO":
     unique_keys = {(item['branch_id'], item['product_id']) for item in inventory}
     for (b_id, p_id) in unique_keys:
         velocity_cache[(b_id, p_id)] = get_sales_velocity(b_id, p_id)
+    skipped_no_expiry = 0
     for item in inventory:
         product = item.get('products') or {}
         product_name = product.get('name', 'Unknown')
@@ -477,6 +502,7 @@ elif page == "Risk & FEFO":
         quantity = item.get('quantity', 0)
         expiry_date_str = item.get('expiry_date')
         if not expiry_date_str:
+            skipped_no_expiry += 1
             continue
         expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d').date()
         days_to_expiry = (expiry_date - today).days
@@ -505,6 +531,8 @@ elif page == "Risk & FEFO":
             'branch_id': item['branch_id'],
             'product_id': item['product_id']
         })
+    if skipped_no_expiry:
+        st.info(f"ℹ️ {skipped_no_expiry} items skipped because they have no expiry date.")
     if not risk_data:
         st.warning("No valid inventory items with expiry dates found.")
         st.stop()
@@ -573,7 +601,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# NEW PAGE: TRANSFER SUGGESTIONS
+# PAGE: TRANSFER SUGGESTIONS (with days_str fix)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
@@ -585,14 +613,12 @@ elif page == "Transfer Suggestions":
     - **High‑value slow movers** = financial exposure > ₦100k and sales velocity < 0.5 units/day → consolidate
     """)
     
-    # Fetch all branches
     all_branches = supabase.table("branches").select("id, name").execute().data
     if len(all_branches) < 2:
         st.info("Need at least two branches to suggest transfers. Please add more branches.")
         st.stop()
     branch_map = {b['id']: b['name'] for b in all_branches}
     
-    # Fetch inventory with product details for ALL branches (ignore global branch filter)
     inv_all = supabase.table("inventory").select("""
         id, batch, quantity, expiry_date, branch_id, product_id,
         products(name, sku, cost)
@@ -602,8 +628,6 @@ elif page == "Transfer Suggestions":
         st.info("No inventory data found. Please upload inventory first.")
         st.stop()
     
-    # Group by branch, product
-    from collections import defaultdict
     branch_product_data = defaultdict(lambda: {
         'total_qty': 0,
         'batches': [],
@@ -614,7 +638,6 @@ elif page == "Transfer Suggestions":
         'days_inventory': float('inf')
     })
     
-    # Prepare demand cache
     velocity_cache = {}
     reorder_cache = {}
     for inv_item in inv_all:
@@ -627,7 +650,6 @@ elif page == "Transfer Suggestions":
             rp, ss = get_reorder_point(b_id, p_id)
             reorder_cache[key] = (rp, ss)
     
-    # Aggregate batches
     for inv_item in inv_all:
         b_id = inv_item['branch_id']
         p_id = inv_item['product_id']
@@ -644,7 +666,6 @@ elif page == "Transfer Suggestions":
         branch_product_data[key]['reorder_point'] = rp
         branch_product_data[key]['safety_stock'] = ss
         
-        # Store batch info for expiry logic
         if expiry:
             days_left = (datetime.strptime(expiry, '%Y-%m-%d').date() - date.today()).days
             branch_product_data[key]['batches'].append({
@@ -654,24 +675,22 @@ elif page == "Transfer Suggestions":
                 'days_left': days_left
             })
     
-    # Compute days of inventory for each branch-product
     for key, data in branch_product_data.items():
         vel = data['sales_velocity']
         if vel > 0:
             data['days_inventory'] = data['total_qty'] / vel
         else:
-            data['days_inventory'] = 999  # effectively infinite if no demand
+            data['days_inventory'] = 999
     
-    # Identify surplus and deficit
-    surplus_items = []   # (branch_id, product_id, total_qty, days_inv, reorder_point, safety_stock, batches, cost)
-    deficit_items = []   # same structure
+    surplus_items = []
+    deficit_items = []
     for key, data in branch_product_data.items():
         b_id, p_id = key
         qty = data['total_qty']
         days = data['days_inventory']
         rp = data['reorder_point']
         ss = data['safety_stock']
-        is_surplus = (days > 45) or (qty > (rp + ss + 10))  # +10 small buffer
+        is_surplus = (days > 45) or (qty > (rp + ss + 10))
         is_deficit = (days < 7) or (qty < rp)
         if is_surplus:
             surplus_items.append({
@@ -698,27 +717,26 @@ elif page == "Transfer Suggestions":
                 'sales_velocity': data['sales_velocity']
             })
     
-    # Generate suggestions
     suggestions = []
     
-    # 1. Surplus → Deficit for the same product
     for surp in surplus_items:
         for defi in deficit_items:
             if surp['product_id'] == defi['product_id'] and surp['branch_id'] != defi['branch_id']:
                 transfer_qty = min(surp['quantity'] - (surp['reorder_point'] + surp['safety_stock']), 
                                    (defi['reorder_point'] + defi['safety_stock']) - defi['quantity'])
                 if transfer_qty > 0:
+                    days_from_str = f"{surp['days_inventory']:.0f}" if surp['days_inventory'] < 999 else "No recent sales"
+                    days_to_str = f"{defi['days_inventory']:.0f}" if defi['days_inventory'] < 999 else "No recent sales"
                     suggestions.append({
                         'from_branch': branch_map[surp['branch_id']],
                         'to_branch': branch_map[defi['branch_id']],
                         'product_name': next((p['products']['name'] for p in inv_all if p['product_id'] == surp['product_id']), 'Unknown'),
                         'sku': next((p['products']['sku'] for p in inv_all if p['product_id'] == surp['product_id']), ''),
                         'quantity': transfer_qty,
-                        'reason': f"Surplus in {branch_map[surp['branch_id']]} ({surp['days_inventory']:.0f} days of stock) → deficit in {branch_map[defi['branch_id']]} (only {defi['days_inventory']:.0f} days left).",
+                        'reason': f"Surplus in {branch_map[surp['branch_id']]} ({days_from_str} of stock) → deficit in {branch_map[defi['branch_id']]} (only {days_to_str} left).",
                         'urgency': 'HIGH' if defi['days_inventory'] < 3 else 'MEDIUM'
                     })
     
-    # 2. Expiry risk transfer: batches expiring within 30 days in branch with low velocity -> transfer to branch with higher velocity
     for inv_item in inv_all:
         expiry = inv_item.get('expiry_date')
         if not expiry:
@@ -728,9 +746,7 @@ elif page == "Transfer Suggestions":
             b_id_from = inv_item['branch_id']
             p_id = inv_item['product_id']
             vel_from = velocity_cache.get((b_id_from, p_id), 0.0)
-            # Low velocity in source (<= 0.5 units/day)
             if vel_from <= 0.5:
-                # Find branch with highest velocity for same product
                 best_target = None
                 best_vel = vel_from
                 for target_branch in all_branches:
@@ -752,11 +768,9 @@ elif page == "Transfer Suggestions":
                         'urgency': 'CRITICAL' if days_left <= 7 else 'HIGH'
                     })
     
-    # 3. High-value slow movers consolidation (financial exposure > 100k and velocity < 0.5)
     for key, data in branch_product_data.items():
         b_id, p_id = key
         if data['total_qty'] * data['cost'] > 100000 and data['sales_velocity'] < 0.5:
-            # Suggest moving to a central branch with higher demand or just consolidate to one branch (pick first other branch)
             if len(all_branches) > 1:
                 target_branch = all_branches[0]['id']
                 if target_branch == b_id:
@@ -771,7 +785,6 @@ elif page == "Transfer Suggestions":
                     'urgency': 'MEDIUM'
                 })
     
-    # Remove duplicates (same from, to, product)
     unique_suggestions = []
     seen = set()
     for s in suggestions:
@@ -780,16 +793,13 @@ elif page == "Transfer Suggestions":
             seen.add(key)
             unique_suggestions.append(s)
     
-    # Display
     if unique_suggestions:
         df_sugg = pd.DataFrame(unique_suggestions)
-        # Sort by urgency
         urgency_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2}
         df_sugg['urgency_num'] = df_sugg['urgency'].map(urgency_order)
         df_sugg = df_sugg.sort_values('urgency_num')
         st.subheader("📋 Suggested Transfers")
         st.dataframe(df_sugg[['from_branch', 'to_branch', 'product_name', 'sku', 'quantity', 'urgency', 'reason']])
-        
         st.subheader("📊 Summary by Urgency")
         st.bar_chart(df_sugg['urgency'].value_counts())
     else:
