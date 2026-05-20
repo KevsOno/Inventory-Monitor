@@ -697,16 +697,16 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (uses combined view_all_transfer_suggestions)
+# PAGE: TRANSFER SUGGESTIONS (with Execute button that logs stock movements)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
     st.markdown("""
-    **Optimised suggestions** – computed entirely inside the database for speed and scalability.
+    **Optimised suggestions** – computed entirely inside the database.
     - **Surplus → Deficit:** Branch has excess stock; another branch needs it.
     - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
     - **Urgency:** CRITICAL (immediate attention), HIGH, or MEDIUM.
-    - No client‑side memory overhead – only final suggestions are fetched.
+    - Click **Execute** to record the transfer as stock movements – the system will automatically learn from it.
     """)
     try:
         query = supabase.table("view_all_transfer_suggestions").select("*")
@@ -718,22 +718,95 @@ elif page == "Transfer Suggestions":
         st.error("⚠️ Unable to fetch transfer suggestions. Please contact your administrator.")
         st.stop()
     
-    if isinstance(suggestions, list) and len(suggestions) > 0:
-        df_sugg = pd.DataFrame(suggestions)
-        # Show batch column only if any expiry suggestions exist
-        display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','reason']
-        if df_sugg['batch'].notna().any():
-            display_cols.insert(3, 'batch')
-        st.subheader("📋 Suggested Transfers")
-        st.dataframe(df_sugg[display_cols])
-        st.subheader("📊 Urgency Breakdown")
-        st.bar_chart(df_sugg['urgency'].value_counts())
-    else:
+    if not isinstance(suggestions, list) or len(suggestions) == 0:
         st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
+        st.stop()
+    
+    # Build dataframe
+    df_sugg = pd.DataFrame(suggestions)
+    display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','reason']
+    if df_sugg['batch'].notna().any():
+        display_cols.insert(3, 'batch')
+    
+    # Show each suggestion with an Execute button
+    for idx, row in df_sugg.iterrows():
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"**{row['product_name']}** ({row['sku']})")
+                st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
+                st.caption(f"⚠️ {row['reason']} (Urgency: {row['urgency']})")
+                if pd.notna(row.get('batch')):
+                    st.caption(f"Batch: `{row['batch']}`")
+            with col2:
+                if st.button(f"✅ Execute", key=f"exec_{idx}"):
+                    try:
+                        # 1. Record movement at source branch (negative)
+                        supabase.table("stock_movements").insert({
+                            "branch_id": row['from_branch_id'],
+                            "product_id": row['product_id'],
+                            "quantity_change": -row['quantity'],
+                            "movement_date": date.today().isoformat(),
+                            "notes": f"Transfer to {row['to_branch']} - system suggestion on {date.today()}"
+                        }).execute()
+                        
+                        # 2. Record movement at target branch (positive)
+                        supabase.table("stock_movements").insert({
+                            "branch_id": row['to_branch_id'],
+                            "product_id": row['product_id'],
+                            "quantity_change": row['quantity'],
+                            "movement_date": date.today().isoformat(),
+                            "notes": f"Transfer from {row['from_branch']} - system suggestion"
+                        }).execute()
+                        
+                        # 3. Update inventory: decrease source, increase target
+                        # Source inventory update
+                        src_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['from_branch_id']).eq("product_id", row['product_id'])
+                        if pd.notna(row.get('batch')):
+                            src_query = src_query.eq("batch", row['batch'])
+                        src_inv = src_query.execute().data
+                        if src_inv:
+                            new_src_qty = src_inv[0]['quantity'] - row['quantity']
+                            supabase.table("inventory").update({"quantity": new_src_qty}).eq("id", src_inv[0]['id']).execute()
+                        else:
+                            st.warning(f"Source inventory record not found for product {row['product_id']} in branch {row['from_branch']}. Stock movement recorded but inventory not adjusted.")
+                        
+                        # Target inventory update (find or create)
+                        tgt_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['to_branch_id']).eq("product_id", row['product_id'])
+                        if pd.notna(row.get('batch')):
+                            tgt_query = tgt_query.eq("batch", row['batch'])
+                        tgt_inv = tgt_query.execute().data
+                        if tgt_inv:
+                            new_tgt_qty = tgt_inv[0]['quantity'] + row['quantity']
+                            supabase.table("inventory").update({"quantity": new_tgt_qty}).eq("id", tgt_inv[0]['id']).execute()
+                        else:
+                            # Create new inventory record at target branch
+                            # Use batch if provided, otherwise generate a transfer batch name
+                            batch_val = row.get('batch') if pd.notna(row.get('batch')) else f"TRANSFER-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                            supabase.table("inventory").insert({
+                                "branch_id": row['to_branch_id'],
+                                "product_id": row['product_id'],
+                                "batch": batch_val,
+                                "quantity": row['quantity'],
+                                "expiry_date": None,  # optional; can be derived from source if needed
+                                "storage_location": "warehouse"
+                            }).execute()
+                        
+                        st.success(f"✅ Transfer of {row['quantity']} units executed! Stock movements recorded. The system will automatically learn from this in the next daily update.")
+                        # Refresh to remove the executed suggestion
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to execute transfer: {e}")
+            st.divider()
+    
+    st.subheader("📊 Urgency Breakdown")
+    st.bar_chart(df_sugg['urgency'].value_counts())
+    
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
         - **Surplus → Deficit:** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point.
         - **Expiry risk:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
         - **Urgency:** CRITICAL (expiry ≤7 days or deficit very high), HIGH, or MEDIUM.
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
+        - When you click **Execute**, the system records stock movements and updates inventory, enabling automatic learning.
         """)
