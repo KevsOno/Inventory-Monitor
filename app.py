@@ -83,10 +83,15 @@ def validate_csv_columns(df, required_cols, label="CSV"):
     return True, ""
 
 def upload_csv_to_table(table_name, df, extra_columns={}):
-    """Chunked upload with partial‑failure protection."""
     for col, val in extra_columns.items():
         df[col] = val
     records = df.to_dict(orient="records")
+    
+    for rec in records:
+        for k, v in rec.items():
+            if isinstance(v, (date, datetime)):
+                rec[k] = v.isoformat()
+    
     chunk_size = 500
     total_chunks = (len(records) + chunk_size - 1) // chunk_size
     i = 0
@@ -96,17 +101,89 @@ def upload_csv_to_table(table_name, df, extra_columns={}):
             supabase.table(table_name).insert(records[i:i+chunk_size]).execute()
         return True, None
     except Exception as e:
-        error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. No data was committed for this chunk. Error: {e}"
+        error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. Error: {e}"
         return False, error_msg
 
-def chunked_sku_lookup(skus, chunk_size=200):
-    """Given a list of SKUs, return a dict {sku: id} using batched queries."""
+def get_existing_skus_with_padding():
+    """Fetch all SKUs from products table and compute max length for zero-padding."""
+    all_skus = supabase.table("products").select("sku").execute().data
+    sku_list = [s['sku'] for s in all_skus]
+    if not sku_list:
+        return {}, 0
+    max_len = max(len(sku) for sku in sku_list)
+    # Create a mapping from "normalised" (zero-padded to max_len) to original SKU
+    # But also keep a direct mapping for exact matches
+    exact_map = {sku: sku for sku in sku_list}
+    padded_map = {}
+    for sku in sku_list:
+        # Try to interpret as number, zero-pad to max_len
+        if sku.isdigit():
+            padded = sku.zfill(max_len)
+            padded_map[padded] = sku
+    return exact_map, padded_map, max_len
+
+def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
+    """
+    Match CSV SKUs to existing products using exact match and zero-padding.
+    Auto-create only truly missing SKUs.
+    """
+    exact_map, padded_map, max_len = get_existing_skus_with_padding()
+    
     sku_to_id = {}
-    for i in range(0, len(skus), chunk_size):
-        chunk = skus[i:i+chunk_size]
-        products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
-        for p in products_data:
-            sku_to_id[p['sku']] = p['id']
+    missing_raw = []
+    
+    for raw_sku in skus:
+        raw_sku_str = str(raw_sku).strip()
+        # Try exact match
+        if raw_sku_str in exact_map:
+            # Get product ID from database (we need ID, not just SKU)
+            # We'll fetch IDs in a batch later; for now store the SKU that matches
+            sku_to_id[raw_sku_str] = None  # placeholder
+            continue
+        # Try zero-padded match (if raw_sku looks like a number)
+        if raw_sku_str.isdigit():
+            padded = raw_sku_str.zfill(max_len)
+            if padded in padded_map:
+                original_sku = padded_map[padded]
+                sku_to_id[raw_sku_str] = None
+                continue
+        # Not found
+        missing_raw.append(raw_sku_str)
+    
+    # Now fetch IDs for all matched SKUs (both exact and padded)
+    matched_skus = [s for s in sku_to_id.keys()]
+    if matched_skus:
+        # Fetch product IDs for these SKUs from DB
+        # Chunked lookup to avoid URL limit
+        chunk_size = 200
+        for i in range(0, len(matched_skus), chunk_size):
+            chunk = matched_skus[i:i+chunk_size]
+            products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
+            for p in products_data:
+                sku_to_id[p['sku']] = p['id']
+    
+    # Auto-create missing products (use raw SKU as is, without padding)
+    if missing_raw:
+        new_products = []
+        for sku in missing_raw:
+            new_products.append({
+                "sku": sku,
+                "name": f"Auto-created: {sku}",
+                "category": "Auto-created",
+                "shelf_life_days": default_shelf_life,
+                "cost": default_cost
+            })
+        chunk_size = 200
+        for i in range(0, len(new_products), chunk_size):
+            supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
+        # Fetch IDs for newly created products
+        for i in range(0, len(missing_raw), chunk_size):
+            chunk = missing_raw[i:i+chunk_size]
+            products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
+            for p in products_data:
+                sku_to_id[p['sku']] = p['id']
+        st.warning(f"⚠️ Auto-created {len(missing_raw)} missing product(s) with default values. Please review and update them later in the Products page.")
+    
     return sku_to_id
 
 # ---------- PAGINATION COUNT CACHING ----------
@@ -238,7 +315,7 @@ elif page == "Branches":
     st.markdown("---")
     st.subheader("📁 Bulk Upload Branches CSV")
     st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`, `manager_email`")
-    st.info("📌 Recommended max rows: 500 – branches are typically small. Upload is chunked (500 rows per batch).")
+    st.info("📌 Recommended max rows: 500 – branches are typically small.")
     template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email'])
     csv = template_df.to_csv(index=False)
     st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
@@ -264,7 +341,7 @@ elif page == "Branches":
                 st.error(err)
 
 # ============================================================
-# PAGE: PRODUCTS (pagination + CSV upload added)
+# PAGE: PRODUCTS (pagination + CSV upload)
 # ============================================================
 elif page == "Products":
     st.header("📦 Products Master")
@@ -312,11 +389,7 @@ elif page == "Products":
 
     st.markdown("---")
     st.subheader("📁 Bulk Upload Products CSV")
-    st.markdown("""
-    **CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  
-    ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically into 500‑row batches).  
-    For larger product catalogues, split into multiple files.
-    """)
+    st.markdown("**CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  \n⚠️ **Recommended max rows:** 5,000 per upload.")
     template_products = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
     template_products.loc[0] = ['SKU001', 'Test Product', 'Category A', 90, 1000.00]
     csv_products = template_products.to_csv(index=False)
@@ -330,13 +403,14 @@ elif page == "Products":
         if not is_valid:
             st.error(msg)
             st.stop()
-        # Ensure optional columns exist
         if 'category' not in df_prod.columns:
             df_prod['category'] = None
         if 'shelf_life_days' not in df_prod.columns:
             df_prod['shelf_life_days'] = 90
         if 'cost' not in df_prod.columns:
             df_prod['cost'] = 0.0
+        df_prod['shelf_life_days'] = pd.to_numeric(df_prod['shelf_life_days'], errors='coerce').fillna(90).astype(int)
+        df_prod['cost'] = pd.to_numeric(df_prod['cost'], errors='coerce').fillna(0.0)
         if st.button("Upload Products"):
             success, err = upload_csv_to_table("products", df_prod[['sku','name','category','shelf_life_days','cost']])
             if success:
@@ -346,7 +420,7 @@ elif page == "Products":
                 st.error(err)
 
 # ============================================================
-# PAGE: INVENTORY
+# PAGE: INVENTORY (view based)
 # ============================================================
 elif page == "Inventory":
     st.header("📦 Current Inventory")
@@ -382,7 +456,7 @@ elif page == "Inventory":
     st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: CSV UPLOAD (Inventory & Movements) with chunked SKU lookup
+# PAGE: CSV UPLOAD (Inventory & Movements) with robust SKU matching
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
@@ -391,14 +465,14 @@ elif page == "CSV Upload":
     if upload_type == "Inventory (current stock)":
         st.markdown("""
         ### 📋 Required CSV Headers for Inventory
-        - `product_sku` – SKU (must exist in Products table)
+        - `product_sku` – SKU (will auto‑create product if missing)
         - `batch` – batch identifier
         - `quantity` – integer
         - `expiry_date` – YYYY-MM-DD
         - `storage_location` – warehouse / shelf / cold_room
 
         ⚠️ **Recommended max rows:** 5,000 per upload (chunked into 500‑row batches).  
-        For larger inventories, split into multiple files.
+        ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
         template_df.loc[0] = ['SKU12345', 'BATCH-001', 100, '2026-12-31', 'warehouse']
@@ -412,7 +486,8 @@ elif page == "CSV Upload":
         - `movement_date` – YYYY-MM-DD
         - `notes` – optional text
 
-        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).
+        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).  
+        ❗ Movements require that the SKU already exists in products (no auto‑creation for movements).
         """)
         template_df = pd.DataFrame(columns=['product_sku','quantity_change','movement_date','notes'])
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
@@ -440,13 +515,22 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
+            # Clean SKU column: to string, strip spaces, remove empty
+            df['product_sku'] = df['product_sku'].astype(str).str.strip()
+            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
+
+            # Convert quantity to integer
+            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int)
+            df['quantity'] = df['quantity'].clip(lower=0)
+
             skus = df['product_sku'].unique().tolist()
-            # chunked SKU lookup
-            sku_to_id = chunked_sku_lookup(skus)
+            # Use robust matching with zero-padding
+            sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ SKUs not found in products table: {missing}. Please add them first.")
+            # If any SKU still has no ID (should not happen after ensure_products_exist), skip
+            if df['product_id'].isna().any():
+                missing_after = df[df['product_id'].isna()]['product_sku'].unique()
+                st.error(f"❌ SKUs could not be matched or created: {missing_after}. Please check product master.")
                 st.stop()
 
             df['branch_id'] = selected_branch_id
@@ -460,20 +544,57 @@ elif page == "CSV Upload":
                 else:
                     st.error(err)
 
-        else:  # movements
+        else:  # movements (no auto‑create)
             required_cols = {'product_sku','quantity_change','movement_date'}
             is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
             if not is_valid:
                 st.error(msg)
                 st.stop()
 
+            # Clean SKU column
+            df['product_sku'] = df['product_sku'].astype(str).str.strip()
+            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
+
+            # Convert quantity_change to integer
+            df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
+
             skus = df['product_sku'].unique().tolist()
-            sku_to_id = chunked_sku_lookup(skus)
-            df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ SKUs not found in products table: {missing}")
+            # For movements, we cannot auto-create; we must match existing using same logic
+            # Reuse ensure_products_exist but without auto-create? Simpler: use a lookup function
+            # We'll call ensure_products_exist but it will auto-create; we don't want that.
+            # So we'll use a separate matching function that only matches, doesn't create.
+            # But to avoid complexity, we can first try to match with the same normalisation.
+            # We'll implement a simple match using zero-padding.
+            exact_map, padded_map, max_len = get_existing_skus_with_padding()
+            sku_to_id = {}
+            for raw_sku in skus:
+                raw = str(raw_sku).strip()
+                if raw in exact_map:
+                    # Need ID; fetch later
+                    sku_to_id[raw] = None
+                elif raw.isdigit():
+                    padded = raw.zfill(max_len)
+                    if padded in padded_map:
+                        sku_to_id[raw] = None
+                    else:
+                        sku_to_id[raw] = None  # will be flagged missing
+                else:
+                    sku_to_id[raw] = None
+            # Fetch IDs for matched SKUs
+            matched_skus = list(sku_to_id.keys())
+            if matched_skus:
+                chunk_size = 200
+                for i in range(0, len(matched_skus), chunk_size):
+                    chunk = matched_skus[i:i+chunk_size]
+                    products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
+                    for p in products_data:
+                        sku_to_id[p['sku']] = p['id']
+            # Identify missing (still None)
+            missing = [s for s, id_ in sku_to_id.items() if id_ is None]
+            if missing:
+                st.error(f"❌ SKUs not found in products table: {missing}. Please add them first (or use Inventory upload to auto‑create).")
                 st.stop()
+            df['product_id'] = df['product_sku'].map(sku_to_id)
 
             df['branch_id'] = selected_branch_id
             df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
@@ -489,7 +610,7 @@ elif page == "CSV Upload":
                     st.error(err)
 
 # ============================================================
-# PAGE: ALERTS & ADVISORIES (pagination)
+# PAGE: ALERTS & ADVISORIES
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
@@ -540,7 +661,7 @@ elif page == "Alerts & Advisories":
         st.info("All displayed alerts have been actioned.")
 
 # ============================================================
-# PAGE: AI LIMITS (pagination)
+# PAGE: AI LIMITS
 # ============================================================
 elif page == "AI Limits":
     st.header("📊 AI-Computed Stock Limits")
@@ -577,7 +698,7 @@ elif page == "AI Limits":
     st.caption(f"Page {st.session_state.limits_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: RISK & FEFO (uses view_risk_list)
+# PAGE: RISK & FEFO
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -652,7 +773,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (database view)
+# PAGE: TRANSFER SUGGESTIONS
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
