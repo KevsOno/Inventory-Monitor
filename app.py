@@ -83,10 +83,12 @@ def validate_csv_columns(df, required_cols, label="CSV"):
     return True, ""
 
 def upload_csv_to_table(table_name, df, extra_columns={}):
+    """Chunked upload with date serialization and integer safety."""
     for col, val in extra_columns.items():
         df[col] = val
     records = df.to_dict(orient="records")
     
+    # Convert dates to ISO strings
     for rec in records:
         for k, v in rec.items():
             if isinstance(v, (date, datetime)):
@@ -104,68 +106,24 @@ def upload_csv_to_table(table_name, df, extra_columns={}):
         error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. Error: {e}"
         return False, error_msg
 
-def get_existing_skus_with_padding():
-    """Fetch all SKUs from products table and compute max length for zero-padding."""
-    all_skus = supabase.table("products").select("sku").execute().data
-    sku_list = [s['sku'] for s in all_skus]
-    if not sku_list:
-        return {}, 0
-    max_len = max(len(sku) for sku in sku_list)
-    # Create a mapping from "normalised" (zero-padded to max_len) to original SKU
-    # But also keep a direct mapping for exact matches
-    exact_map = {sku: sku for sku in sku_list}
-    padded_map = {}
-    for sku in sku_list:
-        # Try to interpret as number, zero-pad to max_len
-        if sku.isdigit():
-            padded = sku.zfill(max_len)
-            padded_map[padded] = sku
-    return exact_map, padded_map, max_len
+def chunked_sku_lookup(skus, chunk_size=200):
+    """Return dict {sku: id} using batched queries."""
+    sku_to_id = {}
+    for i in range(0, len(skus), chunk_size):
+        chunk = skus[i:i+chunk_size]
+        products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
+        for p in products_data:
+            sku_to_id[p['sku']] = p['id']
+    return sku_to_id
 
 def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
-    """
-    Match CSV SKUs to existing products using exact match and zero-padding.
-    Auto-create only truly missing SKUs.
-    """
-    exact_map, padded_map, max_len = get_existing_skus_with_padding()
+    """Auto‑create missing products and return {sku: id} for all."""
+    sku_to_id = chunked_sku_lookup(skus)
+    missing = [sku for sku in skus if sku not in sku_to_id]
     
-    sku_to_id = {}
-    missing_raw = []
-    
-    for raw_sku in skus:
-        raw_sku_str = str(raw_sku).strip()
-        # Try exact match
-        if raw_sku_str in exact_map:
-            # Get product ID from database (we need ID, not just SKU)
-            # We'll fetch IDs in a batch later; for now store the SKU that matches
-            sku_to_id[raw_sku_str] = None  # placeholder
-            continue
-        # Try zero-padded match (if raw_sku looks like a number)
-        if raw_sku_str.isdigit():
-            padded = raw_sku_str.zfill(max_len)
-            if padded in padded_map:
-                original_sku = padded_map[padded]
-                sku_to_id[raw_sku_str] = None
-                continue
-        # Not found
-        missing_raw.append(raw_sku_str)
-    
-    # Now fetch IDs for all matched SKUs (both exact and padded)
-    matched_skus = [s for s in sku_to_id.keys()]
-    if matched_skus:
-        # Fetch product IDs for these SKUs from DB
-        # Chunked lookup to avoid URL limit
-        chunk_size = 200
-        for i in range(0, len(matched_skus), chunk_size):
-            chunk = matched_skus[i:i+chunk_size]
-            products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
-            for p in products_data:
-                sku_to_id[p['sku']] = p['id']
-    
-    # Auto-create missing products (use raw SKU as is, without padding)
-    if missing_raw:
+    if missing:
         new_products = []
-        for sku in missing_raw:
+        for sku in missing:
             new_products.append({
                 "sku": sku,
                 "name": f"Auto-created: {sku}",
@@ -176,13 +134,8 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
         chunk_size = 200
         for i in range(0, len(new_products), chunk_size):
             supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
-        # Fetch IDs for newly created products
-        for i in range(0, len(missing_raw), chunk_size):
-            chunk = missing_raw[i:i+chunk_size]
-            products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
-            for p in products_data:
-                sku_to_id[p['sku']] = p['id']
-        st.warning(f"⚠️ Auto-created {len(missing_raw)} missing product(s) with default values. Please review and update them later in the Products page.")
+        sku_to_id.update(chunked_sku_lookup(missing))
+        st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later.")
     
     return sku_to_id
 
@@ -315,7 +268,7 @@ elif page == "Branches":
     st.markdown("---")
     st.subheader("📁 Bulk Upload Branches CSV")
     st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`, `manager_email`")
-    st.info("📌 Recommended max rows: 500 – branches are typically small.")
+    st.info("📌 Recommended max rows: 500. Upload is chunked (500 rows per batch).")
     template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email'])
     csv = template_df.to_csv(index=False)
     st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
@@ -456,7 +409,7 @@ elif page == "Inventory":
     st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: CSV UPLOAD (Inventory & Movements) with robust SKU matching
+# PAGE: CSV UPLOAD (Inventory & Movements) with auto‑create products
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
@@ -471,7 +424,7 @@ elif page == "CSV Upload":
         - `expiry_date` – YYYY-MM-DD
         - `storage_location` – warehouse / shelf / cold_room
 
-        ⚠️ **Recommended max rows:** 5,000 per upload (chunked into 500‑row batches).  
+        ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically).  
         ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
@@ -486,8 +439,8 @@ elif page == "CSV Upload":
         - `movement_date` – YYYY-MM-DD
         - `notes` – optional text
 
-        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).  
-        ❗ Movements require that the SKU already exists in products (no auto‑creation for movements).
+        ⚠️ **Recommended max rows:** 10,000 per upload (chunked automatically).  
+        ❗ Movements require that the SKU already exists in products (no auto‑creation).
         """)
         template_df = pd.DataFrame(columns=['product_sku','quantity_change','movement_date','notes'])
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
@@ -515,19 +468,14 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
-            # Clean SKU column: to string, strip spaces, remove empty
+            # Clean and convert
             df['product_sku'] = df['product_sku'].astype(str).str.strip()
             df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
-
-            # Convert quantity to integer
-            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int)
-            df['quantity'] = df['quantity'].clip(lower=0)
+            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
 
             skus = df['product_sku'].unique().tolist()
-            # Use robust matching with zero-padding
             sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
-            # If any SKU still has no ID (should not happen after ensure_products_exist), skip
             if df['product_id'].isna().any():
                 missing_after = df[df['product_id'].isna()]['product_sku'].unique()
                 st.error(f"❌ SKUs could not be matched or created: {missing_after}. Please check product master.")
@@ -551,50 +499,17 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
-            # Clean SKU column
             df['product_sku'] = df['product_sku'].astype(str).str.strip()
             df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
-
-            # Convert quantity_change to integer
             df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
 
             skus = df['product_sku'].unique().tolist()
-            # For movements, we cannot auto-create; we must match existing using same logic
-            # Reuse ensure_products_exist but without auto-create? Simpler: use a lookup function
-            # We'll call ensure_products_exist but it will auto-create; we don't want that.
-            # So we'll use a separate matching function that only matches, doesn't create.
-            # But to avoid complexity, we can first try to match with the same normalisation.
-            # We'll implement a simple match using zero-padding.
-            exact_map, padded_map, max_len = get_existing_skus_with_padding()
-            sku_to_id = {}
-            for raw_sku in skus:
-                raw = str(raw_sku).strip()
-                if raw in exact_map:
-                    # Need ID; fetch later
-                    sku_to_id[raw] = None
-                elif raw.isdigit():
-                    padded = raw.zfill(max_len)
-                    if padded in padded_map:
-                        sku_to_id[raw] = None
-                    else:
-                        sku_to_id[raw] = None  # will be flagged missing
-                else:
-                    sku_to_id[raw] = None
-            # Fetch IDs for matched SKUs
-            matched_skus = list(sku_to_id.keys())
-            if matched_skus:
-                chunk_size = 200
-                for i in range(0, len(matched_skus), chunk_size):
-                    chunk = matched_skus[i:i+chunk_size]
-                    products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
-                    for p in products_data:
-                        sku_to_id[p['sku']] = p['id']
-            # Identify missing (still None)
-            missing = [s for s, id_ in sku_to_id.items() if id_ is None]
-            if missing:
+            sku_to_id = chunked_sku_lookup(skus)
+            df['product_id'] = df['product_sku'].map(sku_to_id)
+            missing = df[df['product_id'].isna()]['product_sku'].unique()
+            if len(missing) > 0:
                 st.error(f"❌ SKUs not found in products table: {missing}. Please add them first (or use Inventory upload to auto‑create).")
                 st.stop()
-            df['product_id'] = df['product_sku'].map(sku_to_id)
 
             df['branch_id'] = selected_branch_id
             df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
@@ -698,7 +613,7 @@ elif page == "AI Limits":
     st.caption(f"Page {st.session_state.limits_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: RISK & FEFO
+# PAGE: RISK & FEFO (user‑friendly sort labels)
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -717,19 +632,28 @@ elif page == "Risk & FEFO":
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
 
-    sort_by = st.selectbox("Sort by", ["risk_score desc", "expiry_date asc", "financial_value desc"])
+    # User‑friendly sort options
+    sort_display = st.selectbox("Sort by", [
+        "Highest risk first",
+        "Earliest expiry first",
+        "Highest financial value first"
+    ])
+    # Map to actual column/order
+    if sort_display == "Highest risk first":
+        order_col = "risk_score"
+        order_desc = True
+    elif sort_display == "Earliest expiry first":
+        order_col = "expiry_date"
+        order_desc = False
+    else:
+        order_col = "financial_value"
+        order_desc = True
 
     query = supabase.table("view_risk_list").select("id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,financial_value,expiry_date,days_to_expiry,risk_score,risk_level")
     if branch_id:
         query = query.eq("branch_id", branch_id)
 
-    if sort_by == "risk_score desc":
-        query = query.order("risk_score", desc=True)
-    elif sort_by == "expiry_date asc":
-        query = query.order("expiry_date", desc=False)
-    else:
-        query = query.order("financial_value", desc=True)
-
+    query = query.order(order_col, desc=order_desc)
     risk_scores = query.range(offset, offset+PAGE_SIZE-1).execute().data
 
     if not risk_scores:
@@ -773,18 +697,19 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS
+# PAGE: TRANSFER SUGGESTIONS (uses combined view_all_transfer_suggestions)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
     st.markdown("""
     **Optimised suggestions** – computed entirely inside the database for speed and scalability.
-    - **Surplus → Deficit:** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point.
-    - **Urgency:** CRITICAL if deficit is high, HIGH if source branch has low sales velocity, else MEDIUM.
+    - **Surplus → Deficit:** Branch has excess stock; another branch needs it.
+    - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
+    - **Urgency:** CRITICAL (immediate attention), HIGH, or MEDIUM.
     - No client‑side memory overhead – only final suggestions are fetched.
     """)
     try:
-        query = supabase.table("view_transfer_suggestions").select("*")
+        query = supabase.table("view_all_transfer_suggestions").select("*")
         if branch_id:
             query = query.eq("from_branch_id", branch_id)
         res = query.execute()
@@ -792,22 +717,23 @@ elif page == "Transfer Suggestions":
     except Exception as e:
         st.error("⚠️ Unable to fetch transfer suggestions. Please contact your administrator.")
         st.stop()
+    
     if isinstance(suggestions, list) and len(suggestions) > 0:
         df_sugg = pd.DataFrame(suggestions)
+        # Show batch column only if any expiry suggestions exist
+        display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','reason']
+        if df_sugg['batch'].notna().any():
+            display_cols.insert(3, 'batch')
         st.subheader("📋 Suggested Transfers")
-        st.dataframe(df_sugg[['from_branch','to_branch','product_name','sku','quantity','urgency','reason']])
+        st.dataframe(df_sugg[display_cols])
         st.subheader("📊 Urgency Breakdown")
         st.bar_chart(df_sugg['urgency'].value_counts())
     else:
         st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
-        - A **surplus** branch has `total_qty > (reorder_point + safety_stock + 5)`.
-        - A **deficit** branch has `total_qty < reorder_point`.
-        - Transfer quantity is the smaller of surplus excess and deficit need.
-        - **Urgency:**  
-          - `CRITICAL` if the deficit branch needs less than 5 units to restock.  
-          - `HIGH` if the surplus branch has very low daily demand (<0.5 units/day).  
-          - `MEDIUM` otherwise.
+        - **Surplus → Deficit:** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point.
+        - **Expiry risk:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
+        - **Urgency:** CRITICAL (expiry ≤7 days or deficit very high), HIGH, or MEDIUM.
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
