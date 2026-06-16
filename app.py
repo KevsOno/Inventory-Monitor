@@ -48,7 +48,8 @@ def enforce_https():
                 </style>
                 """, unsafe_allow_html=True)
         except Exception as e:
-            logger.warning(f"Could not check HTTPS status: {e}")
+            # Use print since logger might not be initialized yet
+            print(f"Could not check HTTPS status: {e}")
 
 # ---------- RATE LIMITING ----------
 class RateLimiter:
@@ -703,7 +704,10 @@ def get_branches():
     """Get branches with efficient single query"""
     try:
         data = supabase.table("branches").select("id,name,code").execute().data
-        logger.debug("Branches fetched successfully", {"count": len(data)})
+        if not data:
+            logger.warning("No branches found in database")
+        else:
+            logger.debug("Branches fetched successfully", {"count": len(data)})
         return data
     except Exception as e:
         logger.error("Failed to fetch branches", {"error": str(e)})
@@ -713,15 +717,31 @@ def get_branches():
 def get_branch_maps():
     """Pre-compute branch lookup maps to avoid repeated lookups"""
     branches = get_branches()
+    if not branches:
+        return {
+            'id_to_name': {},
+            'name_to_id': {},
+            'id_to_code': {}
+        }
     return {
         'id_to_name': {b['id']: b['name'] for b in branches},
         'name_to_id': {b['name']: b['id'] for b in branches},
         'id_to_code': {b['id']: b['code'] for b in branches}
     }
 
+# Get data with error handling
 branches_data = get_branches()
 branch_maps = get_branch_maps()
-branch_names = [b['name'] for b in branches_data]
+
+# Ensure branch_maps has required keys
+if not branch_maps or 'name_to_id' not in branch_maps:
+    branch_maps = {
+        'id_to_name': {},
+        'name_to_id': {},
+        'id_to_code': {}
+    }
+
+branch_names = [b['name'] for b in branches_data] if branches_data else []
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -730,12 +750,22 @@ def reset_pagination():
     st.session_state.limits_page = 0
     st.session_state.risk_page = 0
 
-selected_branch_name = st.sidebar.selectbox(
-    "Select Branch",
-    ["All Branches"] + branch_names,
-    on_change=reset_pagination
-)
-branch_id = None if selected_branch_name == "All Branches" else branch_maps['name_to_id'].get(selected_branch_name)
+# Safe branch selection
+if branch_names:
+    selected_branch_name = st.sidebar.selectbox(
+        "Select Branch",
+        ["All Branches"] + branch_names,
+        on_change=reset_pagination
+    )
+else:
+    st.sidebar.warning("⚠️ No branches available. Please add branches in the Branches page.")
+    selected_branch_name = "All Branches"
+
+# Safe branch_id assignment
+if selected_branch_name == "All Branches" or not branch_maps.get('name_to_id'):
+    branch_id = None
+else:
+    branch_id = branch_maps['name_to_id'].get(selected_branch_name)
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
