@@ -347,6 +347,11 @@ def get_registered_emails():
         admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
         admin_emails = [e.strip() for e in admin_emails if e.strip()]
         
+        # Add dev_team as admin
+        dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
+        if dev_team_email:
+            admin_emails.append(dev_team_email)
+        
         for admin_email in admin_emails:
             if admin_email in email_map:
                 email_map[admin_email]['access'] = 'Admin'
@@ -545,6 +550,12 @@ if not st.session_state.authenticated:
                     # Check if this is an admin email (can also use admin password)
                     admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
                     admin_emails = [e.strip() for e in admin_emails if e.strip()]
+                    
+                    # Add dev_team as admin
+                    dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
+                    if dev_team_email:
+                        admin_emails.append(dev_team_email)
+                    
                     is_admin = user_role == "admin" or email in admin_emails
                     
                     # Verify password based on role
@@ -594,38 +605,54 @@ if not st.session_state.authenticated:
                             logger.warning(f"Failed viewer login attempt", {"email": email, "attempts_left": attempts_left}, security=True)
                 else:
                     # Email not found in any branch
-                    login_limiter.is_allowed(login_key)
-                    attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                    st.error(f"❌ Email not registered in any branch. {attempts_left} attempts remaining.")
-                    logger.warning(f"Login attempt with unregistered email", {"email": email}, security=True)
-                    
-                    # Show help for debugging
-                    with st.expander("🔍 Need help? Check registered emails"):
-                        st.markdown("""
-                        **Your email must be added to a branch as one of:**
-                        - Storekeeper Email
-                        - Procurement Email  
-                        - Inventory Email
-                        - Auditor Email
-                        - Manager Email
+                    # Check if it's a dev_team email
+                    dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
+                    if email == dev_team_email and pwd == st.secrets.get("APP_PASSWORD", "changeme"):
+                        # Dev team can login with admin password even if not in branches
+                        st.session_state.authenticated = True
+                        st.session_state.user_role = "admin"
+                        st.session_state.user_email = email
+                        st.session_state.user_branches = []
+                        st.session_state.user_role_match = "dev_team"
+                        login_limiter.reset(login_key)
                         
-                        Contact your administrator to add your email to the appropriate branch.
-                        """)
+                        logger.info(f"Dev team user logged in successfully", {
+                            "email": email
+                        }, security=True)
+                        st.rerun()
+                    else:
+                        login_limiter.is_allowed(login_key)
+                        attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
+                        st.error(f"❌ Email not registered in any branch. {attempts_left} attempts remaining.")
+                        logger.warning(f"Login attempt with unregistered email", {"email": email}, security=True)
                         
-                        # Show registered emails (only if admin password is entered correctly)
-                        admin_check = st.text_input("Enter admin password to view registered emails", type="password", key="login_admin_check")
-                        if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
-                            registered_emails = get_registered_emails()
-                            if registered_emails:
-                                st.subheader("📧 Registered Emails")
-                                df_emails = pd.DataFrame(registered_emails)
-                                df_emails['branches'] = df_emails['branches'].apply(
-                                    lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
-                                )
-                                st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
-                        elif admin_check:
-                            st.error("Incorrect admin password")
-                    
+                        # Show help for debugging
+                        with st.expander("🔍 Need help? Check registered emails"):
+                            st.markdown("""
+                            **Your email must be added to a branch as one of:**
+                            - Storekeeper Email
+                            - Procurement Email  
+                            - Inventory Email
+                            - Auditor Email
+                            - Manager Email
+                            
+                            Contact your administrator to add your email to the appropriate branch.
+                            """)
+                            
+                            # Show registered emails (only if admin password is entered correctly)
+                            admin_check = st.text_input("Enter admin password to view registered emails", type="password", key="login_admin_check")
+                            if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
+                                registered_emails = get_registered_emails()
+                                if registered_emails:
+                                    st.subheader("📧 Registered Emails")
+                                    df_emails = pd.DataFrame(registered_emails)
+                                    df_emails['branches'] = df_emails['branches'].apply(
+                                        lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
+                                    )
+                                    st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
+                            elif admin_check:
+                                st.error("Incorrect admin password")
+                        
             except Exception as e:
                 logger.error(f"Login error", {"error": str(e), "email": email}, security=True)
                 st.error(f"Login error: Please try again later.")
@@ -771,7 +798,7 @@ else:
 if st.session_state.user_role == "admin":
     pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "Registered Users", "System Logs", "Data Export", "Security Settings"]
+             "Transfer Suggestions", "Data Export", "System Logs"]
 else:
     pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
@@ -1677,8 +1704,7 @@ elif page == "Branches":
                         "procurement_email": procurement_email or None,
                         "inventory_email": inventory_email or None,
                         "auditor_email": auditor_email or None,
-                        "manager_email": manager_email or None
-                    }).execute()
+                        "manager_email": manager_email or None                    }).execute()
                     st.success(f"Branch '{name}' added.")
                     logger.info(f"Branch added", {"name": name, "code": code})
                     CacheManager.invalidate_all()
@@ -1720,124 +1746,6 @@ elif page == "Branches":
                 st.rerun()
             else:
                 st.error(err)
-
-# ============================================================
-# PAGE: REGISTERED USERS (admin only)
-# ============================================================
-elif page == "Registered Users":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Registered Users page", security=True)
-        st.stop()
-    
-    st.header("📧 Registered Users")
-    st.markdown("View all registered emails and their associated roles and branches.")
-    
-    # Get registered emails
-    with st.spinner("Loading registered users..."):
-        registered_users = get_registered_emails()
-    
-    if registered_users:
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Users", len(registered_users))
-        with col2:
-            admin_count = len([u for u in registered_users if u['access'] == 'Admin'])
-            st.metric("Admins", admin_count)
-        with col3:
-            viewer_count = len([u for u in registered_users if u['access'] == 'Viewer'])
-            st.metric("Viewers", viewer_count)
-        with col4:
-            no_branch = len([u for u in registered_users if not u['branches']])
-            st.metric("No Branch Assigned", no_branch)
-        
-        st.divider()
-        
-        # Detailed table view
-        st.subheader("📋 Detailed User List")
-        
-        display_data = []
-        for user in registered_users:
-            branch_info = []
-            for branch in user['branches']:
-                branch_info.append(f"{branch['name']} ({branch['role']})")
-            
-            display_data.append({
-                "Email": user['email'],
-                "Role": user['role'],
-                "Access Level": user['access'],
-                "Branches": ", ".join(branch_info) if branch_info else "❌ No branch assigned"
-            })
-        
-        df_users = pd.DataFrame(display_data)
-        mobile_friendly_table(df_users)
-        
-        # Export functionality
-        st.subheader("📤 Export User List")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📥 Export as CSV"):
-                csv_data = export_data_to_csv(display_data, "registered_users")
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name=f"registered_users_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
-        with col2:
-            if st.button("📥 Export as Excel"):
-                excel_data = export_data_to_excel(display_data, "registered_users")
-                st.download_button(
-                    label="Download Excel",
-                    data=excel_data,
-                    file_name=f"registered_users_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        
-        # Search functionality
-        st.subheader("🔍 Search Users")
-        search_term = st.text_input("Search by email or role", placeholder="e.g., manager, @company.com")
-        if search_term:
-            filtered = [u for u in display_data if search_term.lower() in u['Email'].lower() or search_term.lower() in u['Role'].lower()]
-            if filtered:
-                st.dataframe(pd.DataFrame(filtered), use_container_width=True)
-            else:
-                st.info("No users found matching your search.")
-        
-        # Show which users can login
-        st.subheader("🔑 Login Status")
-        st.info("""
-        **Users who can login:**
-        - All users with email addresses in branches can login
-        - Managers use the **Admin Password**
-        - Storekeepers, Procurement, Inventory, Auditors use the **Viewer Password**
-        - Additional admin emails can be added in `ADMIN_EMAILS` secret
-        """)
-        
-        # Quick action: Find user by email
-        st.subheader("🔎 Find User")
-        find_email = st.text_input("Enter email to find", placeholder="user@example.com")
-        if find_email:
-            found = [u for u in registered_users if u['email'].lower() == find_email.lower()]
-            if found:
-                st.success(f"✅ User found!")
-                st.json(found[0])
-            else:
-                st.error(f"❌ User with email '{find_email}' not found.")
-                st.info("Make sure the email is added to a branch as one of the email fields.")
-    
-    else:
-        st.warning("No registered users found.")
-        st.markdown("""
-        ### How to register users:
-        1. Go to the **Branches** page
-        2. Add or edit a branch
-        3. Fill in the email fields (Storekeeper, Procurement, Inventory, Auditor, Manager)
-        4. Users with these emails will be able to login
-        
-        **Note:** Managers get Admin access, all others get Viewer access.
-        """)
 
 # ============================================================
 # PAGE: CSV UPLOAD
@@ -2462,95 +2370,3 @@ elif page == "Data Export":
             except Exception as e:
                 logger.error(f"Export failed", {"type": export_type, "error": str(e)})
                 st.error(f"Export failed: {str(e)}")
-
-# ============================================================
-# PAGE: SECURITY SETTINGS (admin only)
-# ============================================================
-elif page == "Security Settings":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Security Settings page", security=True)
-        st.stop()
-    
-    st.header("🔒 Security Settings")
-    st.markdown("Manage security policies and view security status.")
-    
-    st.subheader("📊 Security Status")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
-        if is_production:
-            st.success("✅ HTTPS Enabled (Production)")
-        else:
-            st.warning("⚠️ Development Mode (HTTPS not enforced)")
-    
-    with col2:
-        st.metric("Rate Limit", f"{login_limiter.max_attempts} attempts")
-    
-    with col3:
-        st.metric("Min Password Length", f"{PasswordValidator.MIN_LENGTH} chars")
-    
-    st.subheader("⚙️ Rate Limiting Configuration")
-    col1, col2 = st.columns(2)
-    with col1:
-        new_max_attempts = st.number_input("Max Login Attempts", min_value=3, max_value=10, value=login_limiter.max_attempts)
-    with col2:
-        new_window = st.number_input("Rate Limit Window (seconds)", min_value=60, max_value=3600, value=300)
-    
-    if st.button("Update Rate Limits"):
-        login_limiter.max_attempts = new_max_attempts
-        login_limiter.window_seconds = new_window
-        logger.info(f"Rate limits updated", {"max_attempts": new_max_attempts, "window": new_window}, security=True)
-        st.success("✅ Rate limits updated successfully!")
-        st.rerun()
-    
-    st.subheader("🔐 Password Policy Configuration")
-    col1, col2 = st.columns(2)
-    with col1:
-        min_length = st.number_input("Minimum Password Length", min_value=8, max_value=20, value=PasswordValidator.MIN_LENGTH)
-        require_upper = st.checkbox("Require Uppercase", value=PasswordValidator.REQUIRE_UPPERCASE)
-        require_lower = st.checkbox("Require Lowercase", value=PasswordValidator.REQUIRE_LOWERCASE)
-    with col2:
-        require_digits = st.checkbox("Require Digits", value=PasswordValidator.REQUIRE_DIGITS)
-        require_special = st.checkbox("Require Special Characters", value=PasswordValidator.REQUIRE_SPECIAL)
-    
-    if st.button("Update Password Policy"):
-        PasswordValidator.MIN_LENGTH = min_length
-        PasswordValidator.REQUIRE_UPPERCASE = require_upper
-        PasswordValidator.REQUIRE_LOWERCASE = require_lower
-        PasswordValidator.REQUIRE_DIGITS = require_digits
-        PasswordValidator.REQUIRE_SPECIAL = require_special
-        logger.info("Password policy updated", {"min_length": min_length}, security=True)
-        st.success("✅ Password policy updated successfully!")
-        st.rerun()
-    
-    st.subheader("🛡️ Recent Security Events")
-    security_events = logger.get_security_events()[-20:]
-    if security_events:
-        df_events = pd.DataFrame(security_events)
-        df_events['timestamp'] = pd.to_datetime(df_events['timestamp'])
-        mobile_friendly_table(df_events[['timestamp', 'level', 'message']])
-    else:
-        st.info("No security events logged.")
-    
-    with st.expander("📋 Security Best Practices Checklist", expanded=False):
-        st.markdown("""
-        ✅ **Password Policy:** At least 12 characters with mixed case, digits, and special characters
-        ✅ **Rate Limiting:** 5 attempts per 5 minutes
-        ✅ **HTTPS Enforcement:** HTTPS required in production
-        ✅ **Email-based Authentication:** Users login with email from branches
-        ✅ **Role-based Access:** Managers = Admin, Others = Viewer
-        ✅ **Audit Logging:** All security events logged
-        ✅ **Input Validation:** SKU validation, expiry date validation
-        ✅ **Error Handling:** No sensitive information in error messages
-        ✅ **Data Protection:** Secure data storage in Supabase
-        ✅ **User Management:** View all registered users with roles
-        
-        **Recommendations:**
-        - Regularly review security logs
-        - Enforce password rotation every 90 days
-        - Enable 2FA for admin accounts (future enhancement)
-        - Regular security audits
-        - Monitor failed login attempts
-        """)
