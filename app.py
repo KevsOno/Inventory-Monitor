@@ -754,35 +754,13 @@ def get_branches():
         logger.error("Failed to fetch branches", {"error": str(e)})
         return []
 
-@cached_with_invalidation(ttl=3600, key_prefix="branch_maps")
-def get_branch_maps():
-    """Pre-compute branch lookup maps to avoid repeated lookups"""
-    branches = get_branches()
-    if not branches:
-        return {
-            'id_to_name': {},
-            'name_to_id': {},
-            'id_to_code': {}
-        }
-    return {
-        'id_to_name': {b['id']: b['name'] for b in branches},
-        'name_to_id': {b['name']: b['id'] for b in branches},
-        'id_to_code': {b['id']: b['code'] for b in branches}
-    }
-
 # Get data with error handling
 branches_data = get_branches()
-branch_maps = get_branch_maps()
 
-# Ensure branch_maps has required keys
-if not branch_maps or 'name_to_id' not in branch_maps:
-    branch_maps = {
-        'id_to_name': {},
-        'name_to_id': {},
-        'id_to_code': {}
-    }
-
+# Create simple lookup maps (like the old version)
 branch_names = [b['name'] for b in branches_data] if branches_data else []
+branch_id_map = {b['name']: b['id'] for b in branches_data} if branches_data else {}
+branch_code_map = {b['id']: b['code'] for b in branches_data} if branches_data else {}
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -802,11 +780,11 @@ else:
     st.sidebar.warning("⚠️ No branches available. Please add branches in the Branches page.")
     selected_branch_name = "All Branches"
 
-# Safe branch_id assignment
-if selected_branch_name == "All Branches" or not branch_maps.get('name_to_id'):
+# Simple branch_id assignment (like the old version)
+if selected_branch_name == "All Branches":
     branch_id = None
 else:
-    branch_id = branch_maps['name_to_id'].get(selected_branch_name)
+    branch_id = branch_id_map.get(selected_branch_name)
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
